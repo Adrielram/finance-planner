@@ -21,6 +21,15 @@ const fmtFull = n => `$${Math.round(n).toLocaleString()}`;
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,6);
 const todayStr = () => new Date().toISOString().slice(0,10);
 const fmtPct = v => Number.isInteger(v) ? String(v) : v.toFixed(1);
+const aggregateMonth = (expenses, monthKey, cats) => {
+  const monthExp = expenses.filter(e => e.date && e.date.startsWith(monthKey));
+  const byCat = {}; cats.forEach(c => { byCat[c.id] = 0; });
+  monthExp.forEach(e => { if (byCat[e.category] !== undefined) byCat[e.category] += (e.amount || 0); });
+  const total = monthExp.reduce((a, e) => a + (e.amount || 0), 0);
+  return { totalSpent: total, spentByCategory: byCat };
+};
+const monthLabel = mk => new Date(mk + '-01T00:00:00').toLocaleString('en', { month: 'long', year: 'numeric' });
+const snapExpenseBudget = snap => snap.cats.filter(c => !c.protected).reduce((sum, c) => sum + snap.income * (snap.alloc[c.id] || 0) / 100, 0);
 
 function Slider({ value, onChange, color, max=100 }) {
   const ref = useRef(null); const [drag, setDrag] = useState(false);
@@ -253,6 +262,9 @@ export default function FinancePlanner({ session }) {
   const [saveMsg, setSaveMsg] = useState("");
   const [showAddCat, setShowAddCat] = useState(false);
   const [showQuickAdd, setShowQuickAdd] = useState(false);
+  const [monthlySnapshots, setMonthlySnapshots] = useState({});
+  const [lastSeenMonthKey, setLastSeenMonthKey] = useState(null);
+  const [openMonth, setOpenMonth] = useState(null);
   const skipNextSave = useRef(true);
   const saveTimer = useRef(null);
 
@@ -276,7 +288,39 @@ export default function FinancePlanner({ session }) {
           if (d.expenses) setExpenses(d.expenses);
           if (d.scenarios) setScenarios(d.scenarios);
           if (d.usdArsRate != null) setUsdArsRate(d.usdArsRate);
+
+          const now = new Date();
+          const currentMK = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+          const prevSnaps = d.monthlySnapshots || {};
+          const prevSeen = d.lastSeenMonthKey;
+          if (!prevSeen) {
+            setMonthlySnapshots(prevSnaps);
+            setLastSeenMonthKey(currentMK);
+          } else if (prevSeen !== currentMK && !prevSnaps[prevSeen]) {
+            const snapCats = d.cats || [...DEFAULT_CATS];
+            const snapAlloc = d.alloc || {...DEF_ALLOC};
+            const snapIncome = d.income != null ? d.income : 5000;
+            const { totalSpent, spentByCategory } = aggregateMonth(d.expenses || [], prevSeen, snapCats);
+            setMonthlySnapshots({
+              ...prevSnaps,
+              [prevSeen]: {
+                income: snapIncome,
+                alloc: JSON.parse(JSON.stringify(snapAlloc)),
+                cats: JSON.parse(JSON.stringify(snapCats)),
+                totalSpent, spentByCategory,
+                snapshotAt: new Date().toISOString(),
+              }
+            });
+            setLastSeenMonthKey(currentMK);
+          } else {
+            setMonthlySnapshots(prevSnaps);
+            setLastSeenMonthKey(prevSeen === currentMK ? prevSeen : currentMK);
+          }
+
           setSaveMsg("✓ Restored"); setTimeout(()=>setSaveMsg(""),2500);
+        } else {
+          const now = new Date();
+          setLastSeenMonthKey(`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`);
         }
       } catch(e) { console.error("Load error:", e); setSaveMsg("⚠ Load failed"); setTimeout(()=>setSaveMsg(""),3000); }
       skipNextSave.current = true; setLoaded(true);
@@ -290,7 +334,7 @@ export default function FinancePlanner({ session }) {
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
       try {
-        const payload = { income, cats, alloc, projMo, investRet, goals, debts, expenses, scenarios, usdArsRate };
+        const payload = { income, cats, alloc, projMo, investRet, goals, debts, expenses, scenarios, usdArsRate, monthlySnapshots, lastSeenMonthKey };
         const { error } = await supabase.from('finance_data').upsert({
           user_id: session.user.id, data: payload, updated_at: new Date().toISOString()
         }, { onConflict: 'user_id' });
@@ -298,7 +342,25 @@ export default function FinancePlanner({ session }) {
         setSaveMsg("✓ Saved"); setTimeout(()=>setSaveMsg(""),2000);
       } catch(e) { console.error("Save error:", e); setSaveMsg("⚠ Save failed"); setTimeout(()=>setSaveMsg(""),3000); }
     }, 1000);
-  }, [income, cats, alloc, projMo, investRet, goals, debts, expenses, scenarios, usdArsRate, loaded, session.user.id]);
+  }, [income, cats, alloc, projMo, investRet, goals, debts, expenses, scenarios, usdArsRate, monthlySnapshots, lastSeenMonthKey, loaded, session.user.id]);
+
+  // Recompute snapshot aggregates when expenses change (e.g. user edits a past expense)
+  useEffect(() => {
+    if (!loaded) return;
+    const keys = Object.keys(monthlySnapshots);
+    if (keys.length === 0) return;
+    let changed = false;
+    const next = {...monthlySnapshots};
+    for (const mk of keys) {
+      const snap = monthlySnapshots[mk];
+      const { totalSpent, spentByCategory } = aggregateMonth(expenses, mk, snap.cats);
+      if (snap.totalSpent !== totalSpent || JSON.stringify(snap.spentByCategory) !== JSON.stringify(spentByCategory)) {
+        next[mk] = { ...snap, totalSpent, spentByCategory };
+        changed = true;
+      }
+    }
+    if (changed) setMonthlySnapshots(next);
+  }, [expenses, monthlySnapshots, loaded]);
 
   const totalPct = useMemo(() => parseFloat(Object.values(alloc).reduce((a,b)=>a+b,0).toFixed(2)), [alloc]);
   const isOver = totalPct > 100;
@@ -362,6 +424,7 @@ export default function FinancePlanner({ session }) {
     {id:"goals",label:"Goals",emoji:"◎"},
     {id:"debts",label:"Debts",emoji:"⊘"},
     {id:"history",label:"History",emoji:"≡"},
+    {id:"months",label:"Months",emoji:"⊡"},
     {id:"scenarios",label:"Scenarios",emoji:"⊟"},
   ];
 
@@ -617,6 +680,103 @@ export default function FinancePlanner({ session }) {
                 <button onClick={()=>setExpenses(es=>es.filter((_,j)=>j!==i))} style={{background:"none",border:"none",color:"var(--danger)",cursor:"pointer",fontSize:13}}>×</button></div>))}
           </div>
         </Card></div>)}
+
+        {tab==="months" && (<div className="fu">
+          <Card>
+            <Label>Past Months</Label>
+            {Object.keys(monthlySnapshots).length===0 && (
+              <p style={{fontSize:12,color:"var(--text-dim)",padding:"24px 0",textAlign:"center",lineHeight:1.5}}>
+                Los snapshots se crean automáticamente cuando termina el mes.<br/>
+                Tu historial empieza el mes que viene.
+              </p>
+            )}
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              {Object.keys(monthlySnapshots).sort().reverse().map(mk => {
+                const snap = monthlySnapshots[mk];
+                const budget = snapExpenseBudget(snap);
+                const isOpen = openMonth === mk;
+                const monthExp = expenses.filter(e=>e.date&&e.date.startsWith(mk)).sort((a,b)=>b.date.localeCompare(a.date));
+                const overBudget = snap.totalSpent > budget && budget > 0;
+                return (
+                  <div key={mk} style={{background:"var(--surface2)",borderRadius:10,overflow:"hidden"}}>
+                    <button onClick={()=>setOpenMonth(isOpen?null:mk)} style={{
+                      width:"100%",padding:"12px 14px",background:"transparent",border:"none",cursor:"pointer",
+                      display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,color:"var(--text)",
+                      fontFamily:"'DM Sans',sans-serif"
+                    }}>
+                      <span style={{display:"flex",alignItems:"center",gap:8}}>
+                        <span style={{fontSize:11,color:"var(--text-dim)",transform:isOpen?"rotate(90deg)":"none",transition:"transform .2s"}}>▸</span>
+                        <span style={{fontSize:13,fontWeight:500}}>{monthLabel(mk)}</span>
+                      </span>
+                      <span style={{display:"flex",gap:10,alignItems:"baseline"}}>
+                        <span style={{fontFamily:"'Space Mono',monospace",fontSize:12,fontWeight:700,color:overBudget?"var(--danger)":"var(--green)"}}>{fmtFull(snap.totalSpent)}</span>
+                        <span style={{fontFamily:"'Space Mono',monospace",fontSize:10,color:"var(--text-dim)",opacity:.6}}>/ {fmtFull(budget)}</span>
+                      </span>
+                    </button>
+                    {isOpen && (
+                      <div style={{padding:"4px 16px 16px"}}>
+                        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(110px,1fr))",gap:8,marginBottom:14}}>
+                          {[
+                            {label:"Income",value:fmtFull(snap.income),color:"var(--text)"},
+                            {label:"Budget",value:fmtFull(budget),color:"var(--accent)"},
+                            {label:"Spent",value:fmtFull(snap.totalSpent),color:overBudget?"var(--danger)":"var(--green)"},
+                            {label:overBudget?"Over":"Saved",value:fmtFull(Math.abs(budget-snap.totalSpent)),color:overBudget?"var(--danger)":"var(--green)"},
+                          ].map(c=>(
+                            <div key={c.label} style={{background:"var(--surface)",borderRadius:8,padding:"8px 10px",textAlign:"center"}}>
+                              <div style={{fontSize:9,color:"var(--text-dim)",letterSpacing:1.2,textTransform:"uppercase",marginBottom:3}}>{c.label}</div>
+                              <div style={{fontFamily:"'Space Mono',monospace",fontSize:13,fontWeight:700,color:c.color}}>{c.value}</div>
+                            </div>
+                          ))}
+                        </div>
+                        <Label>Budget vs Actual</Label>
+                        <div style={{display:"flex",flexDirection:"column",gap:12,marginBottom:14}}>
+                          {snap.cats.filter(c=>!c.protected).map(c => {
+                            const allocated = snap.income*(snap.alloc[c.id]||0)/100;
+                            const spent = snap.spentByCategory[c.id]||0;
+                            const over = spent > allocated && allocated > 0;
+                            return (<div key={c.id}>
+                              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                                <span style={{fontSize:11,display:"flex",alignItems:"center",gap:6}}>
+                                  <span style={{color:c.color,fontSize:10}}>{c.icon}</span>{c.label}
+                                </span>
+                                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                                  <span style={{fontFamily:"'Space Mono',monospace",fontSize:10,color:over?"var(--danger)":c.color,fontWeight:700}}>{fmtFull(spent)}</span>
+                                  <span style={{fontFamily:"'Space Mono',monospace",fontSize:9,color:"var(--text-dim)",opacity:.5}}>/ {fmtFull(allocated)}</span>
+                                </div>
+                              </div>
+                              <DualBar spent={spent} allocated={allocated} color={c.color} dayProgress={1}/>
+                            </div>);
+                          })}
+                        </div>
+                        {monthExp.length > 0 && (
+                          <>
+                            <Label>Expenses ({monthExp.length})</Label>
+                            <div style={{display:"flex",flexDirection:"column"}}>
+                              {monthExp.map((ex,i)=>{
+                                const cat = snap.cats.find(c=>c.id===ex.category) || cats.find(c=>c.id===ex.category);
+                                return (<div key={ex.id} style={{display:"flex",alignItems:"center",gap:10,padding:"6px 0",borderBottom:i<monthExp.length-1?"1px solid var(--border)":"none"}}>
+                                  <span style={{color:cat?.color||"var(--text-dim)",fontSize:11,width:14,textAlign:"center"}}>{cat?.icon||"●"}</span>
+                                  <div style={{flex:1,minWidth:0}}>
+                                    <div style={{fontSize:11,fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ex.description||cat?.label||"Expense"}</div>
+                                    <div style={{fontSize:9,color:"var(--text-dim)"}}>{ex.date}</div>
+                                  </div>
+                                  <span style={{fontFamily:"'Space Mono',monospace",fontSize:11,fontWeight:700,color:cat?.color||"var(--text)"}}>${Math.round(ex.amount)}</span>
+                                </div>);
+                              })}
+                            </div>
+                          </>
+                        )}
+                        <div style={{marginTop:12,fontSize:9,color:"var(--text-dim)",opacity:.6,fontFamily:"'Space Mono',monospace"}}>
+                          snapshot · {new Date(snap.snapshotAt).toLocaleDateString()}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+        </div>)}
 
         {tab==="scenarios" && (<div className="fu"><Card>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
