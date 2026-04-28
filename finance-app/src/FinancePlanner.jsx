@@ -118,18 +118,31 @@ const Btn=({children,active,small,danger,style,...p})=><button style={{padding:s
   color:active?"#111":danger?"var(--danger)":"var(--text-dim)",transition:"all .25s",...style}} {...p}>{children}</button>;
 const Progress=({value,max,color})=>{const pct=Math.min(100,(value/(max||1))*100);return<div style={{height:6,borderRadius:3,background:"var(--track)",overflow:"hidden"}}><div style={{width:`${pct}%`,height:"100%",borderRadius:3,background:color,transition:"width .3s"}}/></div>;};
 
-function QuickAddModal({ cats, onAdd, onClose }) {
+function QuickAddModal({ cats, onAdd, onClose, usdArsRate }) {
+  const rateValid = usdArsRate != null && usdArsRate > 0;
   const [amount, setAmount] = useState("");
   const [category, setCategory] = useState(cats[0]?.id || "food");
   const [desc, setDesc] = useState("");
+  const [currency, setCurrency] = useState(rateValid ? "ARS" : "USD");
   const inputRef = useRef(null);
   useEffect(() => { if(inputRef.current) inputRef.current.focus(); }, []);
+  useEffect(() => { if (!rateValid && currency === "ARS") setCurrency("USD"); }, [rateValid, currency]);
   const submit = () => {
     const num = parseFloat(amount);
     if (isNaN(num) || num <= 0) return;
-    onAdd({ id: uid(), date: todayStr(), category, description: desc, amount: num });
+    if (currency === "ARS" && !rateValid) return;
+    const amountUsd = currency === "ARS" ? num / usdArsRate : num;
+    onAdd({ id: uid(), date: todayStr(), category, description: desc, amount: amountUsd });
     onClose();
   };
+  const currBtn = (code, enabled) => ({
+    padding:"6px 14px", borderRadius:16,
+    border: currency===code ? "2px solid var(--accent)" : "1px solid var(--border)",
+    background: currency===code ? "var(--accent)22" : "transparent",
+    color: !enabled ? "var(--text-dim)" : currency===code ? "var(--accent)" : "var(--text-dim)",
+    fontSize:11, cursor: enabled ? "pointer" : "not-allowed", opacity: enabled ? 1 : .5,
+    fontFamily:"'DM Sans',sans-serif", transition:"all .15s", fontWeight:600, letterSpacing:.5
+  });
   return (
     <div style={{position:"fixed",inset:0,background:"#000a",zIndex:999,display:"flex",alignItems:"flex-end",justifyContent:"center",padding:16}} onClick={onClose}>
       <div onClick={e=>e.stopPropagation()} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:16,padding:"22px 20px",maxWidth:400,width:"100%",marginBottom:20}}>
@@ -137,12 +150,38 @@ function QuickAddModal({ cats, onAdd, onClose }) {
           <Label style={{marginBottom:0}}>Quick Expense</Label>
           <button onClick={onClose} style={{background:"none",border:"none",color:"var(--text-dim)",cursor:"pointer",fontSize:18}}>×</button>
         </div>
+        <div style={{display:"flex",gap:6,marginBottom:10}}>
+          <button onClick={()=>setCurrency("USD")} style={currBtn("USD", true)}>USD</button>
+          <button
+            onClick={()=>{ if(rateValid) setCurrency("ARS"); }}
+            disabled={!rateValid}
+            title={rateValid ? "" : "Configurá la tasa USD/ARS en el dashboard"}
+            style={currBtn("ARS", rateValid)}
+          >ARS</button>
+          {rateValid && (
+            <span style={{alignSelf:"center",fontSize:10,color:"var(--text-dim)",fontFamily:"'Space Mono',monospace",marginLeft:"auto"}}>
+              1$ = {usdArsRate} ARS
+            </span>
+          )}
+        </div>
+        {!rateValid && (
+          <div style={{fontSize:10,color:"var(--text-dim)",marginBottom:10}}>
+            Configurá la tasa USD/ARS arriba para cargar en pesos.
+          </div>
+        )}
         <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:14}}>
-          <span style={{fontFamily:"'Space Mono',monospace",color:"var(--accent)",fontSize:28}}>$</span>
+          <span style={{fontFamily:"'Space Mono',monospace",color:"var(--accent)",fontSize:currency==="ARS"?22:28}}>
+            {currency==="ARS" ? "$ARS" : "$"}
+          </span>
           <input ref={inputRef} type="number" value={amount} min={0} step="any" placeholder="0"
             onChange={e=>setAmount(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")submit();}}
             style={{fontSize:28,fontWeight:700,padding:"8px 12px",flex:1}}/>
         </div>
+        {currency==="ARS" && rateValid && amount && parseFloat(amount)>0 && (
+          <div style={{fontSize:11,color:"var(--text-dim)",marginTop:-8,marginBottom:14,fontFamily:"'Space Mono',monospace"}}>
+            ≈ ${(parseFloat(amount)/usdArsRate).toFixed(2)} USD
+          </div>
+        )}
         <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:14}}>
           {cats.map(c=>(<button key={c.id} onClick={()=>setCategory(c.id)} style={{
             padding:"6px 12px",borderRadius:16,border:category===c.id?`2px solid ${c.color}`:"1px solid var(--border)",
@@ -209,6 +248,7 @@ export default function FinancePlanner({ session }) {
   const [debts, setDebts] = useState([]);
   const [expenses, setExpenses] = useState([]);
   const [scenarios, setScenarios] = useState([]);
+  const [usdArsRate, setUsdArsRate] = useState(null);
   const [compareIds, setCompareIds] = useState([]);
   const [saveMsg, setSaveMsg] = useState("");
   const [showAddCat, setShowAddCat] = useState(false);
@@ -235,6 +275,7 @@ export default function FinancePlanner({ session }) {
           if (d.debts) setDebts(d.debts);
           if (d.expenses) setExpenses(d.expenses);
           if (d.scenarios) setScenarios(d.scenarios);
+          if (d.usdArsRate != null) setUsdArsRate(d.usdArsRate);
           setSaveMsg("✓ Restored"); setTimeout(()=>setSaveMsg(""),2500);
         }
       } catch(e) { console.error("Load error:", e); setSaveMsg("⚠ Load failed"); setTimeout(()=>setSaveMsg(""),3000); }
@@ -249,7 +290,7 @@ export default function FinancePlanner({ session }) {
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
       try {
-        const payload = { income, cats, alloc, projMo, investRet, goals, debts, expenses, scenarios };
+        const payload = { income, cats, alloc, projMo, investRet, goals, debts, expenses, scenarios, usdArsRate };
         const { error } = await supabase.from('finance_data').upsert({
           user_id: session.user.id, data: payload, updated_at: new Date().toISOString()
         }, { onConflict: 'user_id' });
@@ -257,7 +298,7 @@ export default function FinancePlanner({ session }) {
         setSaveMsg("✓ Saved"); setTimeout(()=>setSaveMsg(""),2000);
       } catch(e) { console.error("Save error:", e); setSaveMsg("⚠ Save failed"); setTimeout(()=>setSaveMsg(""),3000); }
     }, 1000);
-  }, [income, cats, alloc, projMo, investRet, goals, debts, expenses, scenarios, loaded, session.user.id]);
+  }, [income, cats, alloc, projMo, investRet, goals, debts, expenses, scenarios, usdArsRate, loaded, session.user.id]);
 
   const totalPct = useMemo(() => parseFloat(Object.values(alloc).reduce((a,b)=>a+b,0).toFixed(2)), [alloc]);
   const isOver = totalPct > 100;
@@ -360,6 +401,14 @@ export default function FinancePlanner({ session }) {
               <input type="number" value={income} min={0} step={100} onChange={e=>setIncome(Math.max(0,+e.target.value))} style={{fontSize:18,fontWeight:700,padding:"6px 10px"}}/></div></div>
           <div><Label>Horizon</Label><div style={{display:"flex",alignItems:"center",gap:4}}><input type="number" value={projMo} min={1} max={360} onChange={e=>setProjMo(Math.max(1,Math.min(360,+e.target.value)))} style={{width:58,textAlign:"center"}}/><span style={{fontSize:10,color:"var(--text-dim)"}}>mo</span></div></div>
           <div><Label>Return %/yr</Label><input type="number" value={investRet} min={0} max={30} step={.5} onChange={e=>setInvestRet(Math.max(0,Math.min(30,+e.target.value)))} style={{width:58,textAlign:"center"}}/></div>
+          <div><Label>USD/ARS Rate</Label>
+            <div style={{display:"flex",alignItems:"center",gap:4}}>
+              <span style={{fontFamily:"'Space Mono',monospace",color:"var(--text-dim)",fontSize:11}}>1$ =</span>
+              <input type="number" value={usdArsRate ?? ""} min={0} step="any" placeholder="—"
+                onChange={e=>{const v=e.target.value;setUsdArsRate(v===""?null:Math.max(0,+v));}}
+                style={{width:78,textAlign:"center"}}/>
+              <span style={{fontSize:10,color:"var(--text-dim)"}}>ARS</span>
+            </div></div>
         </Card>
 
         <div style={{display:"flex",gap:5,marginBottom:14,flexWrap:"wrap",overflowX:"auto"}}>
@@ -595,7 +644,7 @@ export default function FinancePlanner({ session }) {
         boxShadow:"0 4px 20px #FFB86C44, 0 2px 8px #0006",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100
       }}>+</button>
 
-      {showQuickAdd && <QuickAddModal cats={expenseCats} onAdd={addExpense} onClose={()=>setShowQuickAdd(false)}/>}
+      {showQuickAdd && <QuickAddModal cats={expenseCats} onAdd={addExpense} onClose={()=>setShowQuickAdd(false)} usdArsRate={usdArsRate}/>}
       {showAddCat && <AddCategoryModal onAdd={addCategory} onClose={()=>setShowAddCat(false)} existingIds={cats.map(c=>c.id)}/>}
     </>
   );
