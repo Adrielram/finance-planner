@@ -1,0 +1,100 @@
+name: Supabase keep-alive
+
+# Supabase pausa los proyectos del plan Free tras ~7 dias de baja actividad.
+# Los docs piden "a few user requests to the database each day", asi que esto
+# corre todos los dias y hace 3 requests reales al REST endpoint.
+#
+# El request pega contra finance_data con la anon key. RLS lo filtra y devuelve
+# [], pero la query igual se ejecuta contra Postgres: eso es lo que cuenta como
+# actividad. No hace falta tocar el schema ni exponer data.
+
+on:
+  schedule:
+    # 13:17 UTC = 10:17 AR. Minuto "raro" a proposito: los schedules de GitHub
+    # se encolan y se atrasan bastante cuando caen en la hora en punto.
+    - cron: '17 13 * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping Supabase REST endpoint
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "${SUPABASE_URL}" ] || [ -z "${SUPABASE_ANON_KEY}" ]; then
+            echo "Faltan los secrets SUPABASE_URL / SUPABASE_ANON_KEY."
+            exit 1
+          fi
+
+          url="${SUPABASE_URL%/}/rest/v1/finance_data?select=user_id&limit=1"
+          fail=0
+
+          for i in 1 2 3; do
+            code=$(curl -sS -o /tmp/resp -w '%{http_code}' --max-time 30 \
+              "$url" \
+              -H "apikey: ${SUPABASE_ANON_KEY}" \
+              -H "Authorization: Bearer ${SUPABASE_ANON_KEY}") || code=000
+
+            if [ "$code" = "200" ]; then
+              echo "ping $i -> HTTP 200 ok"
+            else
+              echo "ping $i -> HTTP $code"
+              echo "  body: $(head -c 500 /tmp/resp 2>/dev/null)"
+              fail=1
+            fi
+
+            if [ "$i" -lt 3 ]; then sleep 5; fi
+          done
+
+          if [ "$fail" -ne 0 ]; then
+            echo ""
+            echo "El proyecto puede estar pausado, o la anon key/URL cambiaron."
+            exit 1
+          fi
+
+          echo "Proyecto activo."
+
+  # GitHub deshabilita los workflows programados tras 60 dias sin commits nuevos
+  # en el repo. Los runs del propio workflow NO resetean ese contador: solo los
+  # commits. Sin esto, el keep-alive se apaga solo a los 2 meses de no tocar el
+  # codigo, y Supabase pausa 7 dias despues.
+  #
+  # Corre siempre, incluso si el ping fallo: si el proyecto ya esta pausado,
+  # igual queremos que el workflow siga habilitado.
+  keep-workflow-enabled:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Commit mensual para resetear el contador de inactividad
+        run: |
+          set -euo pipefail
+
+          if [ "$(date -u +%d)" != "01" ]; then
+            echo "Hoy no es dia 1, nada que hacer."
+            exit 0
+          fi
+
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/keepalive-timestamp
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/keepalive-timestamp
+
+          if git diff --staged --quiet; then
+            echo "Sin cambios que commitear."
+            exit 0
+          fi
+
+          # [skip ci] evita que Vercel redeployee la app por este commit.
+          git commit -m "chore: keepalive timestamp [skip ci]"
+          git push
