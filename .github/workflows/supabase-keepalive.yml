@@ -67,9 +67,10 @@ jobs:
   #
   # Corre siempre, incluso si el ping fallo: si el proyecto ya esta pausado,
   # igual queremos que el workflow siga habilitado.
+  # El chequeo de dia 1 alcanza como guarda, asi que este job corre tambien en
+  # dispatch manual: permite testear el push sin esperar al cron.
   keep-workflow-enabled:
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
     permissions:
       contents: write
     steps:
