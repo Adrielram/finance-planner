@@ -16,6 +16,17 @@ const ICON_OPTIONS = ["●","◆","★","✦","♦","▲","◉","⬟","⬡","♠
 const COLOR_OPTIONS = ["#E8927C","#7CBEAB","#C4A6E8","#E8D06C","#6CB4E8","#E87CA6","#A6D9E8","#D4A6E8","#E8C46C","#6CE8B4","#E86C8A","#8AA6E8","#C4E86C","#E8A66C","#6CE8E8","#B86CFF"];
 const DEF_ALLOC = { housing:30, food:15, transport:10, utilities:8, entertainment:7, health:5, personal:5, savings:10, investments:10 };
 
+// Where the money actually is. `sign` is how it affects net worth.
+const ACCOUNT_TYPES = [
+  { id:"cash",       label:"Cash",       icon:"◈", color:"#8CE89C", sign: 1 },
+  { id:"savings",    label:"Savings",    icon:"⬟", color:"#7CBEAB", sign: 1 },
+  { id:"investment", label:"Investment", icon:"▲", color:"#C4A6E8", sign: 1 },
+  { id:"debt",       label:"Debt",       icon:"⊘", color:"#E8927C", sign:-1 },
+];
+const acctType = id => ACCOUNT_TYPES.find(t => t.id === id) || ACCOUNT_TYPES[0];
+// Balances go stale. Anything past this many days gets flagged in the UI.
+const STALE_DAYS = 30;
+
 const fmt = n => { if(Math.abs(n)>=1e6) return `$${(n/1e6).toFixed(1)}M`; if(Math.abs(n)>=1e3) return `$${(n/1e3).toFixed(1)}K`; return `$${Math.round(n).toLocaleString()}`; };
 const fmtFull = n => `$${Math.round(n).toLocaleString()}`;
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,6);
@@ -30,6 +41,30 @@ const aggregateMonth = (expenses, monthKey, cats) => {
 };
 const monthLabel = mk => new Date(mk + '-01T00:00:00').toLocaleString('en', { month: 'long', year: 'numeric' });
 const snapExpenseBudget = snap => snap.cats.filter(c => !c.protected).reduce((sum, c) => sum + snap.income * (snap.alloc[c.id] || 0) / 100, 0);
+const daysSince = iso => { if(!iso) return null; const d = Math.floor((Date.now() - new Date(iso + 'T00:00:00').getTime())/864e5); return d < 0 ? 0 : d; };
+
+// Everything is displayed in USD, so ARS balances need the rate. If the rate is
+// missing we return null instead of 0 — silently counting an ARS account as
+// zero would understate net worth without telling anyone.
+const balanceToUsd = (acct, rate) => {
+  const bal = acct.balance || 0;
+  if (acct.currency !== "ARS") return bal;
+  return (rate != null && rate > 0) ? bal / rate : null;
+};
+const sumAccountsUsd = (accts, rate) => accts.reduce((sum, a) => {
+  const usd = balanceToUsd(a, rate);
+  return usd == null ? sum : sum + usd;
+}, 0);
+const computeWealth = (accts = [], rate) => {
+  const by = t => accts.filter(a => a.type === t);
+  const liquid   = sumAccountsUsd([...by("cash"), ...by("savings")], rate);
+  const invested = sumAccountsUsd(by("investment"), rate);
+  const debt     = sumAccountsUsd(by("debt"), rate);
+  // ARS balances we couldn't convert because the rate isn't set. Surfaced in
+  // the UI so the total is never quietly wrong.
+  const unconverted = accts.filter(a => balanceToUsd(a, rate) == null).length;
+  return { liquid, invested, debt, net: liquid + invested - debt, unconverted };
+};
 
 function Slider({ value, onChange, color, max=100 }) {
   const ref = useRef(null); const [drag, setDrag] = useState(false);
@@ -75,9 +110,9 @@ function Donut({ cats, allocations, income }) {
   </svg>);
 }
 
-function ProjChart({ income, alloc, months, ret }) {
+function ProjChart({ income, alloc, months, ret, startSaved=0, startInvested=0 }) {
   const sr=(alloc.savings||0)/100, ir=(alloc.investments||0)/100, mr=ret/100/12;
-  const data=[]; let s=0,inv=0;
+  const data=[]; let s=startSaved,inv=startInvested;
   for(let i=0;i<=months;i++){if(i>0){s+=income*sr;inv=inv*(1+mr)+income*ir;}data.push({m:i,s,inv,nw:s+inv});}
   const mx=Math.max(...data.map(d=>d.nw),1);
   const W=520,H=170,p={t:10,r:20,b:28,l:55},pw=W-p.l-p.r,ph=H-p.t-p.b;
@@ -257,6 +292,7 @@ export default function FinancePlanner({ session }) {
   const [debts, setDebts] = useState([]);
   const [expenses, setExpenses] = useState([]);
   const [scenarios, setScenarios] = useState([]);
+  const [accounts, setAccounts] = useState([]);
   const [usdArsRate, setUsdArsRate] = useState(null);
   const [compareIds, setCompareIds] = useState([]);
   const [saveMsg, setSaveMsg] = useState("");
@@ -287,6 +323,7 @@ export default function FinancePlanner({ session }) {
           if (d.debts) setDebts(d.debts);
           if (d.expenses) setExpenses(d.expenses);
           if (d.scenarios) setScenarios(d.scenarios);
+          if (d.accounts) setAccounts(d.accounts);
           if (d.usdArsRate != null) setUsdArsRate(d.usdArsRate);
 
           const now = new Date();
@@ -308,6 +345,9 @@ export default function FinancePlanner({ session }) {
                 alloc: JSON.parse(JSON.stringify(snapAlloc)),
                 cats: JSON.parse(JSON.stringify(snapCats)),
                 totalSpent, spentByCategory,
+                // Balances as last confirmed — this is what builds the real
+                // net-worth curve over time.
+                wealth: computeWealth(d.accounts, d.usdArsRate),
                 snapshotAt: new Date().toISOString(),
               }
             });
@@ -334,7 +374,7 @@ export default function FinancePlanner({ session }) {
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
       try {
-        const payload = { income, cats, alloc, projMo, investRet, goals, debts, expenses, scenarios, usdArsRate, monthlySnapshots, lastSeenMonthKey };
+        const payload = { income, cats, alloc, projMo, investRet, goals, debts, expenses, scenarios, accounts, usdArsRate, monthlySnapshots, lastSeenMonthKey };
         const { error } = await supabase.from('finance_data').upsert({
           user_id: session.user.id, data: payload, updated_at: new Date().toISOString()
         }, { onConflict: 'user_id' });
@@ -342,7 +382,7 @@ export default function FinancePlanner({ session }) {
         setSaveMsg("✓ Saved"); setTimeout(()=>setSaveMsg(""),2000);
       } catch(e) { console.error("Save error:", e); setSaveMsg("⚠ Save failed"); setTimeout(()=>setSaveMsg(""),3000); }
     }, 1000);
-  }, [income, cats, alloc, projMo, investRet, goals, debts, expenses, scenarios, usdArsRate, monthlySnapshots, lastSeenMonthKey, loaded, session.user.id]);
+  }, [income, cats, alloc, projMo, investRet, goals, debts, expenses, scenarios, accounts, usdArsRate, monthlySnapshots, lastSeenMonthKey, loaded, session.user.id]);
 
   // Recompute snapshot aggregates when expenses change (e.g. user edits a past expense)
   useEffect(() => {
@@ -365,12 +405,20 @@ export default function FinancePlanner({ session }) {
   const totalPct = useMemo(() => parseFloat(Object.values(alloc).reduce((a,b)=>a+b,0).toFixed(2)), [alloc]);
   const isOver = totalPct > 100;
 
-  const forecast = useCallback((al, mo) => {
+  // --- Net worth, from the accounts the user actually holds ---
+  const wealth = useMemo(() => computeWealth(accounts, usdArsRate), [accounts, usdArsRate]);
+
+  // Projection now compounds forward from what you already have instead of
+  // restarting at zero every time.
+  const forecast = useCallback((al, mo, startSaved = 0, startInvested = 0) => {
     const sr=(al.savings||0)/100, ir=(al.investments||0)/100, mr=investRet/100/12;
-    let s=0,inv=0; for(let i=0;i<mo;i++){s+=income*sr;inv=inv*(1+mr)+income*ir;}
-    return {saved:s,invested:inv,gains:inv-income*ir*mo,nw:s+inv};
+    let s=startSaved,inv=startInvested; for(let i=0;i<mo;i++){s+=income*sr;inv=inv*(1+mr)+income*ir;}
+    return {saved:s,invested:inv,gains:inv-startInvested-income*ir*mo,nw:s+inv};
   }, [income, investRet]);
-  const summary = useMemo(() => forecast(alloc, projMo), [forecast, alloc, projMo]);
+  const summary = useMemo(
+    () => forecast(alloc, projMo, wealth.liquid, wealth.invested),
+    [forecast, alloc, projMo, wealth.liquid, wealth.invested]
+  );
 
   const now = new Date();
   const daysInMonth = new Date(now.getFullYear(), now.getMonth()+1, 0).getDate();
@@ -406,6 +454,25 @@ export default function FinancePlanner({ session }) {
   const removeCategory = (catId) => { setCats(p=>p.filter(c=>c.id!==catId)); setAlloc(p=>{const n={...p};delete n[catId];return n;}); };
   const addExpense = (exp) => setExpenses(prev => [exp, ...prev]);
 
+  const addAccount = () => setAccounts(prev => [...prev, {
+    id: uid(), name: "", type: "savings", currency: "USD", balance: 0,
+    color: COLOR_OPTIONS[prev.length % COLOR_OPTIONS.length], updatedAt: todayStr()
+  }]);
+  // Touching the balance re-dates the account; renaming or recoloring doesn't,
+  // so the "last updated" badge keeps meaning "when I last confirmed this number".
+  const updateAccount = (id, patch) => setAccounts(prev => prev.map(a =>
+    a.id === id ? { ...a, ...patch, ...("balance" in patch ? { updatedAt: todayStr() } : {}) } : a
+  ));
+  // Unlink any goal pointing here, freezing the last known balance as its manual
+  // value — otherwise the goal would silently drop to a stale number with no
+  // indication that its funding source is gone.
+  const removeAccount = (id) => {
+    const acct = accounts.find(a => a.id === id);
+    const lastUsd = acct ? (balanceToUsd(acct, usdArsRate) ?? 0) : 0;
+    setAccounts(prev => prev.filter(a => a.id !== id));
+    setGoals(prev => prev.map(g => g.accountId === id ? { ...g, accountId: null, saved: lastUsd } : g));
+  };
+
   const projectedMonthSpend = useMemo(() => {
     if (dayOfMonth <= 1) return totalSpent;
     return (totalSpent / dayOfMonth) * daysInMonth;
@@ -419,6 +486,7 @@ export default function FinancePlanner({ session }) {
 
   const tabs = [
     {id:"month",label:"This Month",emoji:"◉"},
+    {id:"wealth",label:"Net Worth",emoji:"◈"},
     {id:"allocate",label:"Allocate",emoji:"⊞"},
     {id:"projection",label:"Projection",emoji:"◸"},
     {id:"goals",label:"Goals",emoji:"◎"},
@@ -553,6 +621,113 @@ export default function FinancePlanner({ session }) {
           </div>
         )}
 
+        {tab==="wealth" && (
+          <div className="fu">
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10,marginBottom:16}}>
+              {[
+                {label:"Net Worth",value:fmtFull(wealth.net),color:"var(--accent)"},
+                {label:"Liquid",value:fmtFull(wealth.liquid),color:"var(--green)"},
+                {label:"Invested",value:fmtFull(wealth.invested),color:"#C4A6E8"},
+                {label:"Debt",value:fmtFull(wealth.debt),color:wealth.debt>0?"var(--danger)":"var(--text-dim)"},
+              ].map(c=>(<Card key={c.label} style={{padding:"12px 14px",textAlign:"center"}}>
+                <div style={{fontSize:9,color:"var(--text-dim)",letterSpacing:1.2,textTransform:"uppercase",marginBottom:4}}>{c.label}</div>
+                <div style={{fontFamily:"'Space Mono',monospace",fontSize:17,fontWeight:700,color:c.color}}>{c.value}</div>
+              </Card>))}
+            </div>
+
+            {wealth.unconverted > 0 && (
+              <Card style={{marginBottom:12,padding:"10px 14px",borderColor:"var(--danger)"}}>
+                <span style={{fontSize:11,color:"var(--danger)"}}>
+                  {wealth.unconverted} {wealth.unconverted===1?"cuenta en ARS queda":"cuentas en ARS quedan"} fuera del total: falta configurar la tasa USD/ARS arriba.
+                </span>
+              </Card>
+            )}
+
+            <Card>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+                <Label style={{marginBottom:0}}>Accounts</Label>
+                <Btn small onClick={addAccount}>+ Add Account</Btn>
+              </div>
+
+              {accounts.length===0 && (
+                <p style={{fontSize:12,color:"var(--text-dim)",padding:"24px 0",textAlign:"center",lineHeight:1.6}}>
+                  Todavía no cargaste dónde está tu plata.<br/>
+                  Agregá una cuenta por cada lugar donde tenés ahorros —<br/>
+                  colchón, plazo fijo, CEDEARs, fondo del viaje.
+                </p>
+              )}
+
+              {ACCOUNT_TYPES.map(t => {
+                const list = accounts.filter(a => a.type === t.id);
+                if (list.length === 0) return null;
+                const subtotal = sumAccountsUsd(list, usdArsRate);
+                return (
+                  <div key={t.id} style={{marginBottom:18}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,paddingBottom:5,borderBottom:"1px solid var(--border)"}}>
+                      <span style={{fontSize:11,color:t.color,display:"flex",alignItems:"center",gap:6,letterSpacing:1,textTransform:"uppercase"}}>
+                        <span>{t.icon}</span>{t.label}
+                      </span>
+                      <span style={{fontFamily:"'Space Mono',monospace",fontSize:12,fontWeight:700,color:t.color}}>
+                        {t.sign<0?"−":""}{fmtFull(subtotal)}
+                      </span>
+                    </div>
+                    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                      {list.map(a => {
+                        const usd = balanceToUsd(a, usdArsRate);
+                        const days = daysSince(a.updatedAt);
+                        const stale = days != null && days > STALE_DAYS;
+                        return (
+                          <div key={a.id} style={{background:"var(--surface2)",borderRadius:10,padding:"12px 14px"}}>
+                            <div style={{display:"flex",gap:8,marginBottom:8,alignItems:"center"}}>
+                              <input type="text" placeholder="Nombre (ej. Plazo fijo Santander)" value={a.name}
+                                onChange={e=>updateAccount(a.id,{name:e.target.value})} style={{flex:1,fontSize:13}}/>
+                              <button onClick={()=>{if(confirm(`Borrar "${a.name||"esta cuenta"}"?`))removeAccount(a.id);}}
+                                style={{background:"none",border:"none",color:"var(--danger)",cursor:"pointer",fontSize:16}}>×</button>
+                            </div>
+                            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(104px,1fr))",gap:8}}>
+                              <div>
+                                <span style={{fontSize:9,color:"var(--text-dim)",textTransform:"uppercase"}}>Type</span>
+                                <select value={a.type} onChange={e=>updateAccount(a.id,{type:e.target.value})} style={{fontSize:11}}>
+                                  {ACCOUNT_TYPES.map(o=><option key={o.id} value={o.id}>{o.label}</option>)}
+                                </select>
+                              </div>
+                              <div>
+                                <span style={{fontSize:9,color:"var(--text-dim)",textTransform:"uppercase"}}>Currency</span>
+                                <select value={a.currency} onChange={e=>updateAccount(a.id,{currency:e.target.value})} style={{fontSize:11}}>
+                                  <option value="USD">USD</option><option value="ARS">ARS</option>
+                                </select>
+                              </div>
+                              <div>
+                                <span style={{fontSize:9,color:"var(--text-dim)",textTransform:"uppercase"}}>
+                                  {t.sign<0?"Owed":"Balance"}
+                                </span>
+                                <input type="number" value={a.balance} min={0} step="any"
+                                  onChange={e=>updateAccount(a.id,{balance:Math.max(0,+e.target.value)})} style={{textAlign:"right"}}/>
+                              </div>
+                            </div>
+                            <div style={{display:"flex",justifyContent:"space-between",marginTop:8,fontSize:10,flexWrap:"wrap",gap:6}}>
+                              <span style={{fontFamily:"'Space Mono',monospace",color:"var(--text-dim)"}}>
+                                {a.currency==="ARS"
+                                  ? (usd==null ? <span style={{color:"var(--danger)"}}>sin tasa — no suma al total</span> : `≈ ${fmtFull(usd)} USD`)
+                                  : `${fmtFull(a.balance||0)} USD`}
+                              </span>
+                              {days!=null && (
+                                <span style={{color:stale?"var(--danger)":"var(--text-dim)",opacity:stale?1:.6}}>
+                                  {days===0?"actualizado hoy":`actualizado hace ${days}d`}{stale?" ⚠":""}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </Card>
+          </div>
+        )}
+
         {tab==="allocate" && (
           <div className="fu" style={{display:"flex",gap:14,flexWrap:"wrap"}}>
             <Card style={{flex:"1 1 340px"}}>
@@ -602,13 +777,13 @@ export default function FinancePlanner({ session }) {
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:14,flexWrap:"wrap",gap:8}}>
             <Label>Wealth Projection — {projMo} months</Label>
             <span style={{fontSize:11,color:"var(--text-dim)"}}>Net Worth: <span style={{fontFamily:"'Space Mono',monospace",fontWeight:700,color:"var(--accent)"}}>{fmt(summary.nw)}</span></span></div>
-          <ProjChart income={income} alloc={alloc} months={projMo} ret={investRet}/>
+          <ProjChart income={income} alloc={alloc} months={projMo} ret={investRet} startSaved={wealth.liquid} startInvested={wealth.invested}/>
           <div style={{marginTop:16,overflowX:"auto"}}>
             <table style={{width:"100%",borderCollapse:"collapse",fontSize:11,fontFamily:"'Space Mono',monospace"}}>
               <thead><tr style={{borderBottom:"1px solid var(--border)"}}>
                 {["Month","Savings","Invested","Gains","Net Worth"].map(h=><th key={h} style={{padding:"5px 10px",textAlign:"right",color:"var(--text-dim)",fontWeight:500,fontSize:10,textTransform:"uppercase"}}>{h}</th>)}
               </tr></thead>
-              <tbody>{[3,6,12,24,36,48,60,84,120,180,240,360].filter(m=>m<=projMo).map(m=>{const f=forecast(alloc,m);
+              <tbody>{[3,6,12,24,36,48,60,84,120,180,240,360].filter(m=>m<=projMo).map(m=>{const f=forecast(alloc,m,wealth.liquid,wealth.invested);
                 return <tr key={m} style={{borderBottom:"1px solid var(--border)"}}>
                   <td style={{padding:"6px 10px",textAlign:"right",color:"var(--text-dim)"}}>{m}</td>
                   <td style={{padding:"6px 10px",textAlign:"right",color:"#8CE89C"}}>{fmt(f.saved)}</td>
@@ -624,18 +799,32 @@ export default function FinancePlanner({ session }) {
             <Btn small onClick={()=>setGoals(g=>[...g,{id:uid(),name:"",target:1000,saved:0,color:cats[goals.length%cats.length].color}])}>+ Add Goal</Btn></div>
           {goals.length===0&&<p style={{fontSize:13,color:"var(--text-dim)",padding:"24px 0",textAlign:"center"}}>No goals yet.</p>}
           <div style={{display:"flex",flexDirection:"column",gap:12}}>
-            {goals.map((g,i)=>{const pct=Math.min(100,(g.saved/(g.target||1))*100);
+            {goals.map((g,i)=>{
+              // A goal linked to an account reads its progress from that
+              // account's balance; unlinked goals keep the manual number.
+              const linked = g.accountId ? accounts.find(a=>a.id===g.accountId) : null;
+              const saved = linked ? (balanceToUsd(linked, usdArsRate) ?? 0) : (g.saved||0);
+              const pct=Math.min(100,(saved/(g.target||1))*100);
               const mSave=income*((alloc.savings||0)+(alloc.investments||0))/100;
-              const rem=Math.max(0,g.target-g.saved); const mtg=mSave>0?Math.ceil(rem/mSave):Infinity;
+              const rem=Math.max(0,g.target-saved); const mtg=mSave>0?Math.ceil(rem/mSave):Infinity;
               return (<div key={g.id} style={{background:"var(--surface2)",borderRadius:10,padding:"14px 16px"}}>
                 <div style={{display:"flex",gap:8,marginBottom:10,flexWrap:"wrap",alignItems:"center"}}>
                   <input type="text" placeholder="Goal name" value={g.name} onChange={e=>setGoals(gs=>gs.map((x,j)=>j===i?{...x,name:e.target.value}:x))} style={{flex:"1 1 140px",fontSize:13}}/>
                   <div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{fontSize:10,color:"var(--text-dim)"}}>Target $</span>
                     <input type="number" value={g.target} min={0} onChange={e=>setGoals(gs=>gs.map((x,j)=>j===i?{...x,target:+e.target.value}:x))} style={{width:90,textAlign:"right"}}/></div>
                   <div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{fontSize:10,color:"var(--text-dim)"}}>Saved $</span>
-                    <input type="number" value={g.saved} min={0} onChange={e=>setGoals(gs=>gs.map((x,j)=>j===i?{...x,saved:+e.target.value}:x))} style={{width:90,textAlign:"right"}}/></div>
+                    {linked
+                      ? <span title="Viene de la cuenta linkeada" style={{width:90,textAlign:"right",fontFamily:"'Space Mono',monospace",fontSize:13,color:g.color,fontWeight:700}}>{fmtFull(saved)}</span>
+                      : <input type="number" value={g.saved} min={0} onChange={e=>setGoals(gs=>gs.map((x,j)=>j===i?{...x,saved:+e.target.value}:x))} style={{width:90,textAlign:"right"}}/>}</div>
                   <button onClick={()=>setGoals(gs=>gs.filter((_,j)=>j!==i))} style={{background:"none",border:"none",color:"var(--danger)",cursor:"pointer",fontSize:16}}>×</button></div>
-                <Progress value={g.saved} max={g.target} color={g.color}/>
+                <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:10}}>
+                  <span style={{fontSize:10,color:"var(--text-dim)",whiteSpace:"nowrap"}}>Funded by</span>
+                  <select value={g.accountId||""} onChange={e=>setGoals(gs=>gs.map((x,j)=>j===i?{...x,accountId:e.target.value||null}:x))} style={{fontSize:11,flex:"1 1 auto"}}>
+                    <option value="">— manual —</option>
+                    {accounts.map(a=><option key={a.id} value={a.id}>{a.name||"(sin nombre)"} · {acctType(a.type).label}</option>)}
+                  </select>
+                </div>
+                <Progress value={saved} max={g.target} color={g.color}/>
                 <div style={{display:"flex",justifyContent:"space-between",marginTop:6,fontSize:11,flexWrap:"wrap",gap:4}}>
                   <span style={{color:g.color,fontFamily:"'Space Mono',monospace",fontWeight:700}}>{pct.toFixed(0)}%</span>
                   <span style={{color:"var(--text-dim)"}}>{rem>0?`${fmtFull(rem)} to go`:"🎉 Goal reached!"}{rem>0&&mtg<Infinity&&<span style={{marginLeft:8,color:"var(--accent)"}}>~{mtg} mo</span>}</span></div>
@@ -721,6 +910,8 @@ export default function FinancePlanner({ session }) {
                             {label:"Budget",value:fmtFull(budget),color:"var(--accent)"},
                             {label:"Spent",value:fmtFull(snap.totalSpent),color:overBudget?"var(--danger)":"var(--green)"},
                             {label:overBudget?"Over":"Saved",value:fmtFull(Math.abs(budget-snap.totalSpent)),color:overBudget?"var(--danger)":"var(--green)"},
+                            // Only on snapshots taken after accounts existed.
+                            ...(snap.wealth ? [{label:"Net Worth",value:fmtFull(snap.wealth.net),color:"#C4A6E8"}] : []),
                           ].map(c=>(
                             <div key={c.label} style={{background:"var(--surface)",borderRadius:8,padding:"8px 10px",textAlign:"center"}}>
                               <div style={{fontSize:9,color:"var(--text-dim)",letterSpacing:1.2,textTransform:"uppercase",marginBottom:3}}>{c.label}</div>
@@ -784,7 +975,7 @@ export default function FinancePlanner({ session }) {
             <Btn small onClick={()=>setScenarios(s=>[...s,{id:uid(),name:`Scenario ${s.length+1}`,alloc:{...alloc}}])}>+ Save Current</Btn></div>
           {scenarios.length===0&&<p style={{fontSize:13,color:"var(--text-dim)",padding:"24px 0",textAlign:"center"}}>Save your current allocation to compare.</p>}
           <div style={{display:"flex",flexDirection:"column",gap:10}}>
-            {scenarios.map((sc,i)=>{const f=forecast(sc.alloc,projMo);const cmp=compareIds.includes(sc.id);
+            {scenarios.map((sc,i)=>{const f=forecast(sc.alloc,projMo,wealth.liquid,wealth.invested);const cmp=compareIds.includes(sc.id);
               return (<div key={sc.id} style={{background:cmp?"#FFB86C0D":"var(--surface2)",borderRadius:10,padding:"12px 14px",border:cmp?"1px solid #FFB86C44":"1px solid transparent"}}>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,gap:6,flexWrap:"wrap"}}>
                   <input type="text" value={sc.name} onChange={e=>setScenarios(ss=>ss.map((x,j)=>j===i?{...x,name:e.target.value}:x))} style={{flex:"1 1 120px",fontSize:13,fontWeight:700,background:"transparent",border:"none",color:"var(--text)"}}/>
